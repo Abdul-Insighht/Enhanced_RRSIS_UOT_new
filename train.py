@@ -199,6 +199,7 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, device, e
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('weight_decay', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=20, fmt='{value:.4f}'))
     metric_logger.add_meter('iou', utils.SmoothedValue(window_size=20, fmt='{value:.4f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -235,6 +236,7 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, device, e
             'loss': outputs['loss'].item(),
             'iou': iou,
             'lr': optimizer.param_groups[0]["lr"],
+            'weight_decay': optimizer.param_groups[0].get("weight_decay", 0.0),
         }
         if 'seg_loss' in outputs:
             log_dict['seg_loss'] = outputs['seg_loss'].item() if isinstance(outputs['seg_loss'], torch.Tensor) else outputs['seg_loss']
@@ -327,10 +329,31 @@ def main():
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        
+        # Optionally load optimizer state, but update hyperparams to match new args
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        for param_group in optimizer.param_groups:
+            # Override weight decay with the newly passed arg
+            param_group['weight_decay'] = args.weight_decay
+            # Override learning rates with newly passed args based on group name
+            if 'name' in param_group:
+                if param_group['name'] == 'lora_adapters':
+                    param_group['lr'] = args.lr_backbone
+                elif param_group['name'] in ['enhancements', 'decoder']:
+                    param_group['lr'] = args.lr_decoder
+                else:
+                    param_group['lr'] = args.lr
+
         start_epoch = ckpt.get('epoch', 0)
         best_iou = ckpt.get('best_iou', 0.0)
         print(f"  Resumed at epoch {start_epoch}, best_iou={best_iou:.4f}")
+        
+        # IMPORTANT FIX: Fast-forward the scheduler to the correct step
+        # otherwise the learning rate will spike back to maximum!
+        if start_epoch > 0:
+            print(f"  Catching up scheduler to epoch {start_epoch}...")
+            for _ in range(start_epoch * steps_per_epoch):
+                scheduler.step()
 
     # ====== Output Directory ======
     os.makedirs(args.output_dir, exist_ok=True)
