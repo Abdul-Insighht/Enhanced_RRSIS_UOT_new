@@ -161,7 +161,7 @@ def validate(model, val_loader, device, epoch):
         if isinstance(captions[0], list):
             captions = [cap[0] for cap in captions]
 
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             outputs = model(images, captions, masks)
 
         loss = outputs['loss'].item()
@@ -211,7 +211,7 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, device, e
         masks = masks.to(device)
 
         # Forward pass with mixed precision
-        with torch.cuda.amp.autocast(enabled=args.fp16):
+        with torch.amp.autocast('cuda', enabled=args.fp16):
             outputs = model(images, captions, masks)
             loss = outputs['loss'] / args.grad_accum_steps
 

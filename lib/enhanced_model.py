@@ -369,8 +369,8 @@ class Enhanced_RRSIS_UOT(nn.Module):
         result = self._select_best_mask(out, B)
 
         # ====== Step 9: Clear Dynamic LoRA conditioning ======
-        if self.use_dynamic_lora and self.lora_manager is not None:
-            self.lora_manager.clear_text_conditioning()
+        # if self.use_dynamic_lora and self.lora_manager is not None:
+        #     self.lora_manager.clear_text_conditioning()
 
         # ====== Step 10: Compute Losses ======
         if masks_gt is not None:
