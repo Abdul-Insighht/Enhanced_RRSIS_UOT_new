@@ -261,14 +261,12 @@ class Enhanced_RRSIS_UOT(nn.Module):
         # Normalize images
         images = self.normalize_image(images)
 
-        # ====== Step 1: Backbone Forward (Vision + Text) ======
-        backbone_out = self.sam3.backbone.forward_image(images)
+        # ====== Step 1: Forward Text First ======
         text_out = self.sam3.backbone.forward_text(captions, device=device)
-        backbone_out.update(text_out)
 
         # ====== Step 1.5: Dynamic LoRA text conditioning ======
         if self.use_dynamic_lora and self.lora_manager is not None:
-            text_feats = backbone_out.get('language_features', None)
+            text_feats = text_out.get('language_features', None)
             if text_feats is not None:
                 # Pool text features for conditioning: (seq, B, C) → (B, C)
                 if text_feats.dim() == 3:
@@ -276,6 +274,10 @@ class Enhanced_RRSIS_UOT(nn.Module):
                 else:
                     pooled_text = text_feats
                 self.lora_manager.set_text_conditioning(pooled_text)
+
+        # ====== Step 1.8: Forward Image (Now with Text Context!) ======
+        backbone_out = self.sam3.backbone.forward_image(images)
+        backbone_out.update(text_out)
 
         # ====== Step 2: OT Feature Alignment ======
         text_feats = backbone_out.get('language_features', None)
