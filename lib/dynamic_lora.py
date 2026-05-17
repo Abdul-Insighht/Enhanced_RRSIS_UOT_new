@@ -99,16 +99,33 @@ class DynamicLoRALinear(nn.Module):
             # Generate scaling vector from text: (B, rank)
             scale = self.text_modulator(self._cached_text_feat)
 
+            # --- Fix for Windowed Attention in ViT ---
+            # During windowed attention, input 'x' gets reshaped so its batch dimension
+            # becomes B * num_windows. We must expand 'scale' to match it.
+            B_x = x.shape[0]
+            B_s = scale.shape[0]
+            
+            if B_x != B_s:
+                if B_x % B_s == 0:
+                    num_windows = B_x // B_s
+                    # ViT window partition groups windows by image, so repeat_interleave is correct:
+                    # [img1, img2] -> [img1_w1, img1_w2, img2_w1, img2_w2]
+                    scale = scale.repeat_interleave(num_windows, dim=0)
+                else:
+                    # Fallback (should not happen in standard ViT)
+                    scale = scale.mean(dim=0, keepdim=True).expand(B_x, -1)
+            # ----------------------------------------
+
             if x.dim() == 3:
-                # x: (B, N, D)
-                hidden = F.linear(x, self.lora_A) # (B, N, rank)
+                # x: (B_w, N, D)
+                hidden = F.linear(x, self.lora_A) # (B_w, N, rank)
                 hidden = hidden * scale.unsqueeze(1) # Broadcast scale over sequence length N
-                delta = F.linear(hidden, self.lora_B) # (B, N, out_features)
+                delta = F.linear(hidden, self.lora_B) # (B_w, N, out_features)
             elif x.dim() == 2:
-                # x: (B, D)
-                hidden = F.linear(x, self.lora_A) # (B, rank)
-                hidden = hidden * scale # (B, rank)
-                delta = F.linear(hidden, self.lora_B) # (B, out_features)
+                # x: (B_w, D)
+                hidden = F.linear(x, self.lora_A) # (B_w, rank)
+                hidden = hidden * scale # (B_w, rank)
+                delta = F.linear(hidden, self.lora_B) # (B_w, out_features)
             else:
                 # Fallback for other dimensions (e.g., 4D)
                 hidden = F.linear(x, self.lora_A)
