@@ -49,6 +49,7 @@ from .contrastive_loss import ContrastiveLoss
 from .ohem_loss import EnhancedOHEMLoss
 from .ot_feature_alignment import OTFeatureAligner
 from .ot_loss import OTSegmentationLoss
+from .prompt_generator import GroundingAwarePromptGenerator
 
 
 class Enhanced_RRSIS_UOT(nn.Module):
@@ -184,6 +185,10 @@ class Enhanced_RRSIS_UOT(nn.Module):
             print("[Enhanced_RRSIS_UOT] Standard Dice+BCE Loss (baseline)")
             self.standard_loss = OTSegmentationLoss()
 
+        # ====== Grounding-Aware Prompt Generator ======
+        print("[Enhanced_RRSIS_UOT] Grounding-Aware Prompt Generation (GPG) enabled")
+        self.gpg = GroundingAwarePromptGenerator(num_points=1)
+
         # ====== Print Summary ======
         get_trainable_params_summary(self)
 
@@ -305,17 +310,33 @@ class Enhanced_RRSIS_UOT(nn.Module):
                         else:
                             fpn_feats[i] = aligned
 
-        # ====== Step 3: Prompt Encoding (text-only, empty geometric) ======
+        # ====== Step 3: Prompt Generation via GPG Module ======
         img_ids = torch.arange(B, device=device)
         text_ids = torch.arange(B, device=device)
+        
+        # Get the transport plan from the last OT aligner
+        P_map = None
+        if self.use_multiscale_ot and hasattr(self, 'ms_ot_aligner'):
+            last_aligner = self.ms_ot_aligner.scale_aligners[-1]
+            P_map = getattr(last_aligner, 'last_P', None)
+        elif hasattr(self, 'ot_aligner'):
+            P_map = getattr(self.ot_aligner, 'last_P', None)
+            
+        input_points = torch.zeros(B, 0, 2, device=device)
+        input_points_mask = torch.zeros(B, 0, device=device, dtype=torch.bool)
+        
+        if P_map is not None:
+            # Generate explicit geometric prompts from structural alignment
+            input_points, input_points_mask, _ = self.gpg(P_map, text_mask, self.image_size, device)
+
         find_input = FindStage(
             img_ids=img_ids,
             text_ids=text_ids,
             input_boxes=torch.zeros(B, 0, 4, device=device),
             input_boxes_mask=torch.zeros(B, 0, device=device, dtype=torch.bool),
             input_boxes_label=torch.zeros(B, 0, device=device, dtype=torch.long),
-            input_points=torch.zeros(B, 0, 2, device=device),
-            input_points_mask=torch.zeros(B, 0, device=device, dtype=torch.bool),
+            input_points=input_points,
+            input_points_mask=input_points_mask,
         )
 
         geometric_prompt = Prompt(
@@ -382,6 +403,13 @@ class Enhanced_RRSIS_UOT(nn.Module):
             else:
                 seg_loss = self._compute_fallback_loss(result['pred_masks'], masks_gt)
 
+            # SCL Loss (Structural Consistency Loss)
+            scl_loss = torch.tensor(0.0, device=device)
+            if self.use_multiscale_ot and hasattr(self, 'ms_ot_aligner'):
+                scl_vals = [a.scl_loss for a in self.ms_ot_aligner.scale_aligners if isinstance(getattr(a, 'scl_loss', 0.0), torch.Tensor)]
+                if scl_vals:
+                    scl_loss = sum(scl_vals) / len(scl_vals)
+
             # Contrastive loss (auxiliary)
             contrastive = torch.tensor(0.0, device=device)
             if self.use_contrastive_loss and hasattr(self, 'contrastive_loss'):
@@ -426,8 +454,9 @@ class Enhanced_RRSIS_UOT(nn.Module):
                         print(f"[WARNING] Contrastive loss skipped: {e}")
                     contrastive = torch.tensor(0.0, device=device)
 
-            result['loss'] = seg_loss + self.contrastive_weight * contrastive
+            result['loss'] = seg_loss + self.contrastive_weight * contrastive + 0.1 * scl_loss
             result['seg_loss'] = seg_loss.detach()
+            result['scl_loss'] = scl_loss.detach() if isinstance(scl_loss, torch.Tensor) else scl_loss
             result['contrastive_loss'] = contrastive.detach() if isinstance(contrastive, torch.Tensor) else contrastive
 
         return result

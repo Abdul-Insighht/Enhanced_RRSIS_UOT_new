@@ -24,78 +24,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TextConditionedLoRA(nn.Module):
-    """
-    HyperNetwork that generates LoRA A and B matrices from text features.
-
-    Given pooled text features, produces low-rank adapter matrices that
-    are specific to the referring expression, allowing the vision encoder
-    to attend to text-relevant visual patterns from the start.
-
-    Args:
-        text_dim: Dimension of input text features.
-        in_features: Input dimension of the target linear layer.
-        out_features: Output dimension of the target linear layer.
-        rank: LoRA rank (low-rank bottleneck dimension).
-        alpha: LoRA scaling factor.
-    """
-
-    def __init__(self, text_dim, in_features, out_features, rank=16, alpha=32.0):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # HyperNetwork: text → LoRA_A (rank × in_features)
-        # Use a 2-layer MLP with bottleneck for efficiency
-        hyper_bottleneck = min(256, text_dim // 2)
-        self.hyper_A = nn.Sequential(
-            nn.Linear(text_dim, hyper_bottleneck),
-            nn.GELU(),
-            nn.Linear(hyper_bottleneck, rank * in_features),
-        )
-
-        # HyperNetwork: text → LoRA_B (out_features × rank)
-        self.hyper_B = nn.Sequential(
-            nn.Linear(text_dim, hyper_bottleneck),
-            nn.GELU(),
-            nn.Linear(hyper_bottleneck, out_features * rank),
-        )
-
-        # Initialize last layer near zero so ΔW starts small
-        nn.init.zeros_(self.hyper_A[-1].weight)
-        nn.init.zeros_(self.hyper_A[-1].bias)
-        nn.init.zeros_(self.hyper_B[-1].weight)
-        nn.init.zeros_(self.hyper_B[-1].bias)
-
-    def forward(self, text_feat):
-        """
-        Generate LoRA matrices from text features.
-
-        Args:
-            text_feat: (B, text_dim) pooled text embedding.
-
-        Returns:
-            lora_A: (B, rank, in_features)
-            lora_B: (B, out_features, rank)
-        """
-        B = text_feat.shape[0]
-        lora_A = self.hyper_A(text_feat).view(B, self.rank, self.in_features)
-        lora_B = self.hyper_B(text_feat).view(B, self.out_features, self.rank)
-        return lora_A, lora_B
-
-
 class DynamicLoRALinear(nn.Module):
     """
     Wraps an existing nn.Linear with a text-conditioned Dynamic LoRA adapter.
+    
+    Instead of generating massive A and B matrices directly from text (which costs 413M params),
+    this uses a Modulated LoRA approach: A and B are static trainable parameters, 
+    but the intermediate bottleneck is element-wise multiplied by a text-generated scale vector.
 
-    The original linear is frozen. During forward, if text features are available,
-    dynamic LoRA matrices are generated; otherwise falls back to static LoRA.
-
-    Output = Original(x) + scaling * (x @ A^T @ B^T)
-    where A, B are generated from text features.
+    Output = Original(x) + scaling * ((x @ A^T) * text_scale) @ B^T
 
     Args:
         original_linear: The frozen nn.Linear layer to wrap.
@@ -108,25 +45,27 @@ class DynamicLoRALinear(nn.Module):
         super().__init__()
         self.original_linear = original_linear
         self.scaling = alpha / rank
+        self.rank = rank
 
         # Freeze original weights
         for param in self.original_linear.parameters():
             param.requires_grad = False
 
-        # Dynamic LoRA generator
-        self.dynamic_lora = TextConditionedLoRA(
-            text_dim=text_dim,
-            in_features=original_linear.in_features,
-            out_features=original_linear.out_features,
-            rank=rank,
-            alpha=alpha,
-        )
+        # Static LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(rank, original_linear.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(original_linear.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
 
-        # Static fallback LoRA (used when no text is available, e.g. init)
-        self.static_lora_A = nn.Parameter(torch.zeros(rank, original_linear.in_features))
-        self.static_lora_B = nn.Parameter(torch.zeros(original_linear.out_features, rank))
-        nn.init.kaiming_uniform_(self.static_lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.static_lora_B)
+        # Text modulation network (generates a scale vector of size 'rank')
+        self.text_modulator = nn.Sequential(
+            nn.Linear(text_dim, text_dim // 2),
+            nn.GELU(),
+            nn.Linear(text_dim // 2, rank)
+        )
+        # Initialize text modulator to output 1.0 so it starts like standard LoRA
+        nn.init.zeros_(self.text_modulator[-1].weight)
+        nn.init.ones_(self.text_modulator[-1].bias)
 
         # Cached text features for current forward pass
         self._cached_text_feat = None
@@ -146,7 +85,7 @@ class DynamicLoRALinear(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass with dynamic or static LoRA.
+        Forward pass with text-modulated LoRA.
 
         Args:
             x: (*, in_features) input tensor.
@@ -157,28 +96,32 @@ class DynamicLoRALinear(nn.Module):
         base_out = self.original_linear(x)
 
         if self._cached_text_feat is not None:
-            # Dynamic LoRA: text-conditioned adaptation
-            lora_A, lora_B = self.dynamic_lora(self._cached_text_feat)
-            B = lora_A.shape[0]
+            # Generate scaling vector from text: (B, rank)
+            scale = self.text_modulator(self._cached_text_feat)
 
-            # x shape: could be (B, N, D) or (B*N, D)
             if x.dim() == 3:
-                # (B, N, D) @ (B, D, rank) → (B, N, rank)
-                delta = torch.bmm(x, lora_A.transpose(1, 2))
-                # (B, N, rank) @ (B, rank, out_D) → (B, N, out_D)
-                delta = torch.bmm(delta, lora_B.transpose(1, 2))
-            elif x.dim() == 2 and x.shape[0] == B:
-                # (B, D) → (B, 1, D) for bmm
-                delta = torch.bmm(x.unsqueeze(1), lora_A.transpose(1, 2))
-                delta = torch.bmm(delta, lora_B.transpose(1, 2)).squeeze(1)
+                # x: (B, N, D)
+                hidden = F.linear(x, self.lora_A) # (B, N, rank)
+                hidden = hidden * scale.unsqueeze(1) # Broadcast scale over sequence length N
+                delta = F.linear(hidden, self.lora_B) # (B, N, out_features)
+            elif x.dim() == 2:
+                # x: (B, D)
+                hidden = F.linear(x, self.lora_A) # (B, rank)
+                hidden = hidden * scale # (B, rank)
+                delta = F.linear(hidden, self.lora_B) # (B, out_features)
             else:
-                # Fallback to static LoRA
-                delta = (x @ self.static_lora_A.T @ self.static_lora_B.T)
+                # Fallback for other dimensions (e.g., 4D)
+                hidden = F.linear(x, self.lora_A)
+                # reshape scale to broadcast
+                scale_view = scale.view(scale.shape[0], *([1]*(x.dim()-2)), scale.shape[-1])
+                hidden = hidden * scale_view
+                delta = F.linear(hidden, self.lora_B)
 
             return base_out + self.scaling * delta
         else:
-            # Static LoRA fallback
-            delta = (x @ self.static_lora_A.T @ self.static_lora_B.T)
+            # Fallback (no text) - acts as standard static LoRA
+            hidden = F.linear(x, self.lora_A)
+            delta = F.linear(hidden, self.lora_B)
             return base_out + self.scaling * delta
 
 

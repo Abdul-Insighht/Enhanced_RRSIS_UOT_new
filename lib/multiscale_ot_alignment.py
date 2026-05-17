@@ -60,6 +60,10 @@ class ScaleAwareOTAligner(nn.Module):
         # Initialize output projection near zero
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
+        
+        # Store for external access
+        self.last_P = None
+        self.scl_loss = 0.0
 
     @torch.no_grad()
     def sinkhorn(self, cost_matrix):
@@ -133,6 +137,25 @@ class ScaleAwareOTAligner(nn.Module):
 
         # Compute OT plan
         P = self.sinkhorn(cost)  # (B, HW, seq)
+        self.last_P = P
+
+        # --- Structural Consistency Loss (SCL) ---
+        # SGSRF's ASCR core logic: enforce semantic dependency alignment
+        # S_txt: (B, seq, seq) linguistic structure
+        txt_norm_scl = F.normalize(text_flat, dim=-1)
+        S_txt = torch.bmm(txt_norm_scl, txt_norm_scl.transpose(1, 2))
+        
+        # S_img: (B, HW, HW) visual layout structure
+        img_norm_scl = F.normalize(img_flat, dim=-1)
+        S_img = torch.bmm(img_norm_scl, img_norm_scl.transpose(1, 2))
+        
+        # Map visual structure to text space using OT plan: P^T @ S_img @ P -> (B, seq, seq)
+        S_img_proj = torch.bmm(torch.bmm(P.transpose(1, 2), S_img), P)
+        S_img_proj = F.normalize(S_img_proj, dim=-1)
+        
+        # SCL is MSE between linguistic structure and projected visual structure
+        self.scl_loss = F.mse_loss(S_img_proj, S_txt)
+        # ----------------------------------------
 
         # Transport text to image positions
         aligned_text = torch.bmm(P * P.shape[1], text_flat)  # (B, HW, C)

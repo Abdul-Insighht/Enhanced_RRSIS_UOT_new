@@ -22,6 +22,10 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 
 from refer.refer import REFER
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from transforms import TargetAwareZoomCrop
 
 
 # ============================================================
@@ -61,6 +65,9 @@ class RRSISDDataset(data.Dataset):
             transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
         ])
+        
+        # Zoom-In Crop
+        self.zoom_crop = TargetAwareZoomCrop(zoom_prob=0.5, small_threshold=0.1) if split == 'train' else None
 
         # Random augmentation for training
         if split == 'train':
@@ -91,6 +98,12 @@ class RRSISDDataset(data.Dataset):
         ref_mask = np.array(self.refer.getMask(ref[0])['mask'])
         annot = np.zeros(ref_mask.shape, dtype=np.uint8)
         annot[ref_mask == 1] = 1
+
+        # Target-aware zoom crop (for extremely small targets)
+        if self.zoom_crop is not None:
+            mask_pil = Image.fromarray(annot)
+            img, mask_pil = self.zoom_crop(img, mask_pil)
+            annot = np.array(mask_pil)
 
         # Resize image and mask
         img = self.img_transform(img)
@@ -156,6 +169,9 @@ class RRSISHRDataset(data.Dataset):
             transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
         ])
+        
+        # Zoom-In Crop
+        self.zoom_crop = TargetAwareZoomCrop(zoom_prob=0.5, small_threshold=0.1) if split == 'train' else None
 
         print(f"[RRSIS-HR] Loaded {len(self.ref_ids)} samples for {split}")
 
@@ -175,6 +191,12 @@ class RRSISHRDataset(data.Dataset):
         ref_mask = np.array(self.refer.getMask(ref[0])['mask'])
         annot = np.zeros(ref_mask.shape, dtype=np.uint8)
         annot[ref_mask == 1] = 1
+        
+        # Target-aware zoom crop
+        if self.zoom_crop is not None:
+            mask_pil = Image.fromarray(annot)
+            img, mask_pil = self.zoom_crop(img, mask_pil)
+            annot = np.array(mask_pil)
 
         # Resize
         img = self.img_transform(img)
@@ -221,6 +243,9 @@ class RefSegRSDataset(data.Dataset):
             transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
         ])
+        
+        # Zoom-In Crop
+        self.zoom_crop = TargetAwareZoomCrop(zoom_prob=0.5, small_threshold=0.1) if split == 'train' else None
 
         print(f"[RefSegRS] Loaded {len(self.imgs)} samples for {split}")
 
@@ -261,6 +286,12 @@ class RefSegRSDataset(data.Dataset):
         ref_mask = np.array(label_mask) > 50
         annot = np.zeros(ref_mask.shape, dtype=np.uint8)
         annot[ref_mask == 1] = 1
+        
+        # Target-aware zoom crop
+        if self.zoom_crop is not None:
+            mask_pil = Image.fromarray(annot)
+            img, mask_pil = self.zoom_crop(img, mask_pil)
+            annot = np.array(mask_pil)
 
         # Resize
         img = self.img_transform(img)
